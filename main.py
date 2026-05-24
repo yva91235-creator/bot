@@ -1,6 +1,10 @@
 import asyncio
 import sqlite3
-from datetime import datetime
+import json
+import hashlib
+import hmac
+import aiohttp
+from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
@@ -15,18 +19,19 @@ TON_WALLET = "UQDtRwosWY6VfPnwovLRcF2yo46Xv3BcK-mV1Da-1LwbVIaE"
 USDT_WALLET = "TKPuYeveSA2giJV9fFcgbCDsY6abmzMS7Z"
 SUPPORT_USERNAME = "@MollyWhip1"
 ADMIN_IDS = [8353710361]
+LOG_CHAT_ID = 8353710361  # Чат для логов
 
 WORKERS = {
-    1: {"name": "🧑‍🌾 Стажёр", "cost": 1, "income": 0.003},
-    2: {"name": "👨‍🔧 Разнорабочий", "cost": 5, "income": 0.02},
-    3: {"name": "👷 Шахтёр", "cost": 20, "income": 0.10},
-    4: {"name": "🔧 Инженер", "cost": 50, "income": 0.30},
-    5: {"name": "🧙‍♂️ Бурильщик", "cost": 100, "income": 0.70},
-    6: {"name": "⚙️ Механик", "cost": 200, "income": 1.60},
-    7: {"name": "🏭 Директор шахты", "cost": 500, "income": 4.50},
-    8: {"name": "👑 Магнат", "cost": 1000, "income": 10.00},
-    9: {"name": "⭐ Олигарх", "cost": 2500, "income": 30.00},
-    10: {"name": "💎 Крипто-король", "cost": 5000, "income": 75.00},
+    1: {"name_ru": "🧑‍🌾 Стажёр", "name_en": "🧑‍🌾 Intern", "cost": 1, "income": 0.003},
+    2: {"name_ru": "👨‍🔧 Разнорабочий", "name_en": "👨‍🔧 Laborer", "cost": 5, "income": 0.02},
+    3: {"name_ru": "👷 Шахтёр", "name_en": "👷 Miner", "cost": 20, "income": 0.10},
+    4: {"name_ru": "🔧 Инженер", "name_en": "🔧 Engineer", "cost": 50, "income": 0.30},
+    5: {"name_ru": "🧙‍♂️ Бурильщик", "name_en": "🧙‍♂️ Driller", "cost": 100, "income": 0.70},
+    6: {"name_ru": "⚙️ Механик", "name_en": "⚙️ Mechanic", "cost": 200, "income": 1.60},
+    7: {"name_ru": "🏭 Директор шахты", "name_en": "🏭 Mine Director", "cost": 500, "income": 4.50},
+    8: {"name_ru": "👑 Магнат", "name_en": "👑 Magnate", "cost": 1000, "income": 10.00},
+    9: {"name_ru": "⭐ Олигарх", "name_en": "⭐ Oligarch", "cost": 2500, "income": 30.00},
+    10: {"name_ru": "💎 Крипто-король", "name_en": "💎 Crypto King", "cost": 5000, "income": 75.00},
 }
 
 FARM_LEVELS = {
@@ -41,6 +46,14 @@ FARM_LEVELS = {
     9: {"workers": 150, "bonus": 60, "cost": 2000},
     10: {"workers": 200, "bonus": 75, "cost": 3000},
 }
+
+DAILY_BONUSES = {
+    1: 0.05, 2: 0.07, 3: 0.10, 4: 0.15, 5: 0.20,
+    6: 0.30, 7: 0.50, 14: 1.00, 21: 2.00, 30: 5.00,
+}
+
+REFERRAL_BONUS = 0.5  # Бонус за приглашённого
+REFERRAL_PERCENT = 0.07  # 7% от дохода реферала
 
 WITHDRAW_MIN = 10
 WITHDRAW_FEE = 0.05
@@ -62,7 +75,10 @@ def init_db():
             farm_level INTEGER DEFAULT 1,
             last_collect TEXT,
             streak INTEGER DEFAULT 0,
-            referred_by INTEGER
+            last_daily TEXT,
+            referred_by INTEGER,
+            language TEXT DEFAULT 'ru',
+            created_at TEXT
         )
     ''')
     
@@ -86,6 +102,35 @@ def init_db():
         )
     ''')
     
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS deposits (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            amount REAL,
+            tx_hash TEXT UNIQUE,
+            status TEXT DEFAULT 'pending',
+            comment TEXT,
+            created_at TEXT,
+            processed_at TEXT
+        )
+    ''')
+    
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS deposit_sessions (
+            user_id INTEGER PRIMARY KEY,
+            amount REAL,
+            comment TEXT,
+            expires_at TEXT
+        )
+    ''')
+    
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS processed_tx (
+            tx_hash TEXT PRIMARY KEY,
+            processed_at TEXT
+        )
+    ''')
+    
     conn.commit()
     conn.close()
 
@@ -104,7 +149,10 @@ def get_user(user_id):
             "farm_level": row[4],
             "last_collect": row[5],
             "streak": row[6],
-            "referred_by": row[7]
+            "last_daily": row[7],
+            "referred_by": row[8],
+            "language": row[9] if len(row) > 9 else "ru",
+            "created_at": row[10] if len(row) > 10 else None
         }
     return None
 
@@ -112,9 +160,22 @@ def create_user(user_id, username, referred_by=None):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute('''
-        INSERT OR IGNORE INTO users (user_id, username, last_collect, referred_by)
-        VALUES (?, ?, ?, ?)
-    ''', (user_id, username, datetime.now().isoformat(), referred_by))
+        INSERT OR IGNORE INTO users (user_id, username, last_collect, referred_by, created_at)
+        VALUES (?, ?, ?, ?, ?)
+    ''', (user_id, username, datetime.now().isoformat(), referred_by, datetime.now().isoformat()))
+    
+    # Если есть реферал, начисляем бонус
+    if referred_by:
+        cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (REFERRAL_BONUS, referred_by))
+        cursor.execute("UPDATE users SET ref_earned = ref_earned + ? WHERE user_id = ?", (REFERRAL_BONUS, referred_by))
+    
+    conn.commit()
+    conn.close()
+
+def update_user_language(user_id, language):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET language = ? WHERE user_id = ?", (language, user_id))
     conn.commit()
     conn.close()
 
@@ -139,6 +200,13 @@ def add_worker(user_id, worker_type):
     cursor.execute("INSERT INTO workers (user_id, worker_type, bought_at) VALUES (?, ?, ?)",
                    (user_id, worker_type, datetime.now().isoformat()))
     cursor.execute("UPDATE users SET total_workers = total_workers + 1 WHERE user_id = ?", (user_id,))
+    
+    # Начисляем бонус рефералу за первого рабочего
+    user = get_user(user_id)
+    if user and user["referred_by"]:
+        if get_worker_count(user_id) == 1:
+            update_balance(user["referred_by"], 1.0)
+    
     conn.commit()
     conn.close()
 
@@ -163,6 +231,20 @@ def update_last_collect(user_id):
     cursor.execute("UPDATE users SET last_collect = ? WHERE user_id = ?", (datetime.now().isoformat(), user_id))
     conn.commit()
     conn.close()
+
+def update_daily_streak(user_id, streak, last_daily):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET streak = ?, last_daily = ? WHERE user_id = ?", (streak, last_daily, user_id))
+    conn.commit()
+    conn.close()
+
+def get_daily_bonus(streak):
+    bonus = DAILY_BONUSES.get(1, 0.05)
+    for day, amount in sorted(DAILY_BONUSES.items()):
+        if streak >= day:
+            bonus = amount
+    return bonus
 
 def create_withdrawal(user_id, amount, address):
     conn = sqlite3.connect(DB_PATH)
@@ -199,7 +281,142 @@ def get_top_players(limit=10):
     conn.close()
     return top
 
+def get_referrals_count(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM users WHERE referred_by = ?", (user_id,))
+    count = cursor.fetchone()[0]
+    conn.close()
+    return count
+
+def create_deposit_session(user_id, amount):
+    import uuid
+    comment = f"DEPOSIT_{user_id}_{uuid.uuid4().hex[:8]}"
+    expires_at = (datetime.now() + timedelta(hours=1)).isoformat()
+    
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT OR REPLACE INTO deposit_sessions (user_id, amount, comment, expires_at)
+        VALUES (?, ?, ?, ?)
+    ''', (user_id, amount, comment, expires_at))
+    conn.commit()
+    conn.close()
+    return comment
+
+def get_deposit_session(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM deposit_sessions WHERE user_id = ? AND expires_at > ?", 
+                   (user_id, datetime.now().isoformat()))
+    row = cursor.fetchone()
+    conn.close()
+    if row:
+        return {"user_id": row[0], "amount": row[1], "comment": row[2], "expires_at": row[3]}
+    return None
+
+def clear_deposit_session(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM deposit_sessions WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+
+def add_deposit(user_id, amount, tx_hash, comment):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO deposits (user_id, amount, tx_hash, comment, status, created_at, processed_at)
+        VALUES (?, ?, ?, ?, 'completed', ?, ?)
+    ''', (user_id, amount, tx_hash, comment, datetime.now().isoformat(), datetime.now().isoformat()))
+    conn.commit()
+    conn.close()
+
+def is_tx_processed(tx_hash):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT 1 FROM processed_tx WHERE tx_hash = ?", (tx_hash,))
+    exists = cursor.fetchone() is not None
+    conn.close()
+    return exists
+
+def mark_tx_processed(tx_hash):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO processed_tx (tx_hash, processed_at) VALUES (?, ?)",
+                   (tx_hash, datetime.now().isoformat()))
+    conn.commit()
+    conn.close()
+
+def get_unprocessed_deposits():
+    """Получает активные сессии для проверки платежей"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM deposit_sessions WHERE expires_at > ?", (datetime.now().isoformat(),))
+    sessions = cursor.fetchall()
+    conn.close()
+    return sessions
+
 # ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
+
+def get_text(key, lang="ru", **kwargs):
+    texts = {
+        "ru": {
+            "balance": "💰 Баланс",
+            "income": "📈 Доход/день",
+            "workers": "👷 Рабочих",
+            "farm_level": "🌾 Уровень фермы",
+            "pending": "⏳ Накоплено",
+            "total_earned": "💎 Всего заработано",
+            "profile": "👤 ПРОФИЛЬ",
+            "shop": "🏪 МАГАЗИН",
+            "my_workers": "👷 МОИ РАБОЧИЕ",
+            "farm": "🌾 ФЕРМА",
+            "daily": "🎁 ЕЖЕДНЕВНЫЙ БОНУС",
+            "referral": "👥 РЕФЕРАЛЫ",
+            "top": "🏆 ТОП ИГРОКОВ",
+            "deposit": "💎 ПОПОЛНЕНИЕ",
+            "withdraw": "💸 ВЫВОД СРЕДСТВ",
+            "back": "◀️ Назад",
+            "collect": "💰 Собрать доход",
+            "upgrade": "⬆️ Улучшить",
+            "confirm": "✅ Подтвердить",
+            "cancel": "❌ Отмена",
+        },
+        "en": {
+            "balance": "💰 Balance",
+            "income": "📈 Income/day",
+            "workers": "👷 Workers",
+            "farm_level": "🌾 Farm level",
+            "pending": "⏳ Pending",
+            "total_earned": "💎 Total earned",
+            "profile": "👤 PROFILE",
+            "shop": "🏪 SHOP",
+            "my_workers": "👷 MY WORKERS",
+            "farm": "🌾 FARM",
+            "daily": "🎁 DAILY BONUS",
+            "referral": "👥 REFERRALS",
+            "top": "🏆 TOP PLAYERS",
+            "deposit": "💎 DEPOSIT",
+            "withdraw": "💸 WITHDRAW",
+            "back": "◀️ Back",
+            "collect": "💰 Collect Income",
+            "upgrade": "⬆️ Upgrade",
+            "confirm": "✅ Confirm",
+            "cancel": "❌ Cancel",
+        }
+    }
+    
+    text = texts.get(lang, texts["ru"]).get(key, key)
+    if kwargs:
+        try:
+            text = text.format(**kwargs)
+        except:
+            pass
+    return text
+
+def format_ton(amount):
+    return f"{amount:.3f}"
 
 def calculate_income(user_id):
     user = get_user(user_id)
@@ -224,71 +441,138 @@ def calculate_pending(user_id):
     if not user or not user["last_collect"]:
         return 0
     
-    last_collect = datetime.fromisoformat(user["last_collect"])
+    try:
+        last_collect = datetime.fromisoformat(user["last_collect"])
+    except:
+        return 0
+    
     income_day = calculate_income(user_id)
     hours_passed = (datetime.now() - last_collect).total_seconds() / 3600
     pending = income_day * (hours_passed / 24)
     
     return round(pending, 4)
 
-def format_ton(amount):
-    return f"{amount:.3f}"
+# ==================== ПРОВЕРКА ПЛАТЕЖЕЙ ====================
+
+async def check_ton_transactions():
+    """Проверка транзакций TON через API toncenter.com"""
+    async with aiohttp.ClientSession() as session:
+        url = f"https://toncenter.com/api/v2/getTransactions"
+        params = {
+            "address": TON_WALLET,
+            "limit": 50
+        }
+        
+        try:
+            async with session.get(url, params=params) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    for tx in data.get("result", []):
+                        tx_hash = tx.get("transaction_id", {}).get("hash")
+                        if not tx_hash or is_tx_processed(tx_hash):
+                            continue
+                        
+                        # Получаем комментарий
+                        comment = ""
+                        for msg in tx.get("in_msg", {}).get("msg_data", {}).get("text", ""):
+                            comment = msg
+                            break
+                        
+                        if not comment or not comment.startswith("DEPOSIT_"):
+                            continue
+                        
+                        # Извлекаем user_id из комментария
+                        parts = comment.split("_")
+                        if len(parts) >= 2:
+                            try:
+                                user_id = int(parts[1])
+                                amount = float(tx.get("amount", 0)) / 1_000_000_000  # nanoTON to TON
+                                
+                                if amount > 0:
+                                    update_balance(user_id, amount)
+                                    add_deposit(user_id, amount, tx_hash, comment)
+                                    mark_tx_processed(tx_hash)
+                                    clear_deposit_session(user_id)
+                                    
+                                    # Уведомляем пользователя
+                                    bot = Bot(token=BOT_TOKEN)
+                                    lang = get_user(user_id)["language"] if get_user(user_id) else "ru"
+                                    await bot.send_message(
+                                        user_id,
+                                        f"✅ {get_text('deposit_success', lang, amount=format_ton(amount))}"
+                                    )
+                                    await bot.close()
+                            except (ValueError, IndexError):
+                                pass
+        except Exception as e:
+            print(f"Ошибка проверки TON: {e}")
+
+async def start_payment_checker():
+    """Запускает периодическую проверку платежей"""
+    while True:
+        try:
+            await check_ton_transactions()
+        except Exception as e:
+            print(f"Payment checker error: {e}")
+        await asyncio.sleep(30)  # Проверка каждые 30 секунд
 
 # ==================== КЛАВИАТУРЫ ====================
 
-def get_main_keyboard():
+def get_main_keyboard(lang="ru"):
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="👤 Профиль", callback_data="menu_profile")],
-        [InlineKeyboardButton(text="🏪 Магазин", callback_data="menu_shop")],
-        [InlineKeyboardButton(text="👷 Мои рабочие", callback_data="menu_workers")],
-        [InlineKeyboardButton(text="🌾 Ферма", callback_data="menu_farm")],
-        [InlineKeyboardButton(text="🎁 Бонус", callback_data="menu_daily")],
-        [InlineKeyboardButton(text="👥 Рефералы", callback_data="menu_referral")],
-        [InlineKeyboardButton(text="🏆 Топ", callback_data="menu_top")],
+        [InlineKeyboardButton(text="👤 " + get_text("profile", lang), callback_data="menu_profile")],
+        [InlineKeyboardButton(text="🏪 " + get_text("shop", lang), callback_data="menu_shop")],
+        [InlineKeyboardButton(text="👷 " + get_text("my_workers", lang), callback_data="menu_workers")],
+        [InlineKeyboardButton(text="🌾 " + get_text("farm", lang), callback_data="menu_farm")],
+        [InlineKeyboardButton(text="🎁 " + get_text("daily", lang), callback_data="menu_daily")],
+        [InlineKeyboardButton(text="👥 " + get_text("referral", lang), callback_data="menu_referral")],
+        [InlineKeyboardButton(text="🏆 " + get_text("top", lang), callback_data="menu_top")],
+        [InlineKeyboardButton(text="🌍 Язык / Language", callback_data="menu_language")],
     ])
 
-def get_back_keyboard():
+def get_back_keyboard(lang="ru"):
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_menu")]
+        [InlineKeyboardButton(text=get_text("back", lang), callback_data="back_to_menu")]
     ])
 
-def get_shop_keyboard():
+def get_shop_keyboard(lang="ru"):
     buttons = []
     for wid, w in WORKERS.items():
+        name = w[f"name_{lang}"] if lang in w else w["name_ru"]
         buttons.append([InlineKeyboardButton(
-            text=f"{w['name']} — {w['cost']} TON",
+            text=f"{name} — {w['cost']} TON",
             callback_data=f"buy_{wid}"
         )])
-    buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_menu")])
+    buttons.append([InlineKeyboardButton(text=get_text("back", lang), callback_data="back_to_menu")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-def get_workers_keyboard():
+def get_workers_keyboard(lang="ru"):
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💰 Собрать доход", callback_data="collect")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_menu")],
+        [InlineKeyboardButton(text=get_text("collect", lang), callback_data="collect")],
+        [InlineKeyboardButton(text=get_text("back", lang), callback_data="back_to_menu")],
     ])
 
-def get_farm_keyboard(user):
+def get_farm_keyboard(user, lang="ru"):
     buttons = []
     current_level = user["farm_level"]
     if current_level < 10:
         next_level = FARM_LEVELS[current_level + 1]
         if user["total_workers"] >= next_level["workers"] and user["balance"] >= next_level["cost"]:
             buttons.append([InlineKeyboardButton(
-                text=f"⬆️ Улучшить ({next_level['cost']} TON)",
+                text=f"{get_text('upgrade', lang)} ({next_level['cost']} TON)",
                 callback_data="upgrade_farm"
             )])
-    buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_menu")])
+    buttons.append([InlineKeyboardButton(text=get_text("back", lang), callback_data="back_to_menu")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-def get_profile_keyboard():
+def get_profile_keyboard(lang="ru"):
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💎 Пополнить", callback_data="menu_deposit")],
-        [InlineKeyboardButton(text="💸 Вывести", callback_data="menu_withdraw")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_menu")],
+        [InlineKeyboardButton(text="💎 " + get_text("deposit", lang), callback_data="menu_deposit")],
+        [InlineKeyboardButton(text="💸 " + get_text("withdraw", lang), callback_data="menu_withdraw")],
+        [InlineKeyboardButton(text=get_text("back", lang), callback_data="back_to_menu")],
     ])
 
-def get_deposit_keyboard():
+def get_deposit_keyboard(lang="ru"):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💎 10 TON", callback_data="deposit_10")],
         [InlineKeyboardButton(text="💎 25 TON", callback_data="deposit_25")],
@@ -297,12 +581,19 @@ def get_deposit_keyboard():
         [InlineKeyboardButton(text="💎 250 TON", callback_data="deposit_250")],
         [InlineKeyboardButton(text="💎 500 TON", callback_data="deposit_500")],
         [InlineKeyboardButton(text="💎 1000 TON", callback_data="deposit_1000")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_menu")],
+        [InlineKeyboardButton(text=get_text("back", lang), callback_data="back_to_menu")],
     ])
 
-def get_withdraw_keyboard():
+def get_withdraw_keyboard(lang="ru"):
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💸 Вывести", callback_data="withdraw_start")],
+        [InlineKeyboardButton(text="💸 " + get_text("withdraw", lang), callback_data="withdraw_start")],
+        [InlineKeyboardButton(text=get_text("back", lang), callback_data="back_to_menu")],
+    ])
+
+def get_language_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🇷🇺 Русский", callback_data="lang_ru")],
+        [InlineKeyboardButton(text="🇬🇧 English", callback_data="lang_en")],
         [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_menu")],
     ])
 
@@ -344,24 +635,43 @@ async def cmd_start(message: Message):
     username = message.from_user.username or ""
     
     user = get_user(user_id)
-    if not user:
-        args = message.text.split()
-        ref_id = None
-        if len(args) > 1:
-            try:
-                ref_id = int(args[1])
-                if ref_id == user_id:
-                    ref_id = None
-            except:
-                pass
-        create_user(user_id, username, ref_id)
-        
-        if ref_id:
-            update_balance(ref_id, 0.5)
     
-    await show_main_menu(message)
+    args = message.text.split()
+    ref_id = None
+    if len(args) > 1:
+        try:
+            ref_id = int(args[1])
+            if ref_id == user_id:
+                ref_id = None
+        except:
+            pass
+    
+    is_new = user is None
+    
+    if is_new:
+        create_user(user_id, username, ref_id)
+        user = get_user(user_id)
+        
+        # Отправляем уведомление рефералу
+        if ref_id:
+            ref_user = get_user(ref_id)
+            if ref_user:
+                lang = ref_user["language"]
+                await bot.send_message(
+                    ref_id,
+                    f"🎉 {get_text('referral_joined', lang, username=username)}\n💰 +{REFERRAL_BONUS} TON"
+                )
+                # Лог в админ чат
+                await bot.send_message(
+                    LOG_CHAT_ID,
+                    f"👤 Новый пользователь: @{username} (ID: {user_id})\n👥 Приглашён: @{ref_user['username']} (ID: {ref_id})"
+                )
+    
+    lang = user["language"] if user else "ru"
+    
+    await show_main_menu(message, lang)
 
-async def show_main_menu(message: Message):
+async def show_main_menu(message: Message, lang="ru"):
     user_id = message.from_user.id
     user = get_user(user_id)
     income = calculate_income(user_id)
@@ -369,50 +679,50 @@ async def show_main_menu(message: Message):
     
     text = f"🏭 <b>WORKERS ON TON</b>\n\n"
     text += f"👤 {user['username'] or 'User'}\n"
-    text += f"💰 Баланс: {format_ton(user['balance'])} TON\n"
-    text += f"📈 Доход/день: {format_ton(income)} TON\n"
-    text += f"👷 Рабочих: {user['total_workers']}\n"
-    text += f"🌾 Уровень фермы: {user['farm_level']}/10\n"
-    text += f"⏳ Накоплено: {format_ton(pending)} TON\n\n"
-    text += f"👇 Выберите действие:"
+    text += f"{get_text('balance', lang)}: {format_ton(user['balance'])} TON\n"
+    text += f"{get_text('income', lang)}: {format_ton(income)} TON\n"
+    text += f"{get_text('workers', lang)}: {user['total_workers']}\n"
+    text += f"{get_text('farm_level', lang)}: {user['farm_level']}/10\n"
+    text += f"{get_text('pending', lang)}: {format_ton(pending)} TON\n\n"
+    text += f"👇 {get_text('select_action', lang) if 'select_action' in get_text('', lang) else 'Выберите действие'}:"
     
-    await message.answer(text, reply_markup=get_main_keyboard(), parse_mode="HTML")
+    await message.answer(text, reply_markup=get_main_keyboard(lang), parse_mode="HTML")
 
 @dp.callback_query(F.data == "back_to_menu")
 async def back_to_menu(callback: CallbackQuery):
     user_id = callback.from_user.id
     user = get_user(user_id)
+    lang = user["language"] if user else "ru"
     income = calculate_income(user_id)
     pending = calculate_pending(user_id)
     
     text = f"🏭 <b>WORKERS ON TON</b>\n\n"
     text += f"👤 {user['username'] or 'User'}\n"
-    text += f"💰 Баланс: {format_ton(user['balance'])} TON\n"
-    text += f"📈 Доход/день: {format_ton(income)} TON\n"
-    text += f"👷 Рабочих: {user['total_workers']}\n"
-    text += f"🌾 Уровень фермы: {user['farm_level']}/10\n"
-    text += f"⏳ Накоплено: {format_ton(pending)} TON\n\n"
-    text += f"👇 Выберите действие:"
+    text += f"{get_text('balance', lang)}: {format_ton(user['balance'])} TON\n"
+    text += f"{get_text('income', lang)}: {format_ton(income)} TON\n"
+    text += f"{get_text('workers', lang)}: {user['total_workers']}\n"
+    text += f"{get_text('farm_level', lang)}: {user['farm_level']}/10\n"
+    text += f"{get_text('pending', lang)}: {format_ton(pending)} TON\n\n"
     
-    await callback.message.edit_text(text, reply_markup=get_main_keyboard(), parse_mode="HTML")
+    await callback.message.edit_text(text, reply_markup=get_main_keyboard(lang), parse_mode="HTML")
     await callback.answer()
 
 # -------------------- ПРОФИЛЬ --------------------
 
 @dp.callback_query(F.data == "menu_profile")
 async def menu_profile(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    user = get_user(user_id)
+    user = get_user(callback.from_user.id)
+    lang = user["language"] if user else "ru"
     
-    text = f"👤 <b>ПРОФИЛЬ</b>\n\n"
-    text += f"🆔 ID: {user_id}\n"
-    text += f"👤 Имя: {user['username'] or 'Не указано'}\n"
-    text += f"💰 Баланс: {format_ton(user['balance'])} TON\n"
-    text += f"👷 Рабочих: {user['total_workers']}\n"
-    text += f"🌾 Уровень фермы: {user['farm_level']}/10\n"
-    text += f"📈 Доход/день: {format_ton(calculate_income(user_id))} TON"
+    text = f"👤 <b>{get_text('profile', lang)}</b>\n\n"
+    text += f"🆔 ID: {callback.from_user.id}\n"
+    text += f"👤 {get_text('name', lang) if 'name' in get_text('', lang) else 'Имя'}: {user['username'] or 'Не указано'}\n"
+    text += f"{get_text('balance', lang)}: {format_ton(user['balance'])} TON\n"
+    text += f"{get_text('workers', lang)}: {user['total_workers']}\n"
+    text += f"{get_text('farm_level', lang)}: {user['farm_level']}/10\n"
+    text += f"{get_text('income', lang)}: {format_ton(calculate_income(callback.from_user.id))} TON"
     
-    await callback.message.edit_text(text, reply_markup=get_profile_keyboard(), parse_mode="HTML")
+    await callback.message.edit_text(text, reply_markup=get_profile_keyboard(lang), parse_mode="HTML")
     await callback.answer()
 
 # -------------------- ПОПОЛНЕНИЕ --------------------
@@ -420,29 +730,38 @@ async def menu_profile(callback: CallbackQuery):
 @dp.callback_query(F.data == "menu_deposit")
 async def menu_deposit(callback: CallbackQuery):
     user = get_user(callback.from_user.id)
+    lang = user["language"] if user else "ru"
     
-    text = f"💎 <b>ПОПОЛНЕНИЕ БАЛАНСА</b>\n\n"
-    text += f"💰 Ваш баланс: {format_ton(user['balance'])} TON\n\n"
-    text += "Выберите сумму для пополнения:"
+    text = f"💎 <b>{get_text('deposit', lang)}</b>\n\n"
+    text += f"{get_text('balance', lang)}: {format_ton(user['balance'])} TON\n\n"
+    text += "Выберите сумму для пополнения:" if lang == "ru" else "Choose deposit amount:"
     
-    await callback.message.edit_text(text, reply_markup=get_deposit_keyboard(), parse_mode="HTML")
+    await callback.message.edit_text(text, reply_markup=get_deposit_keyboard(lang), parse_mode="HTML")
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("deposit_"))
 async def deposit_amount(callback: CallbackQuery):
+    user = get_user(callback.from_user.id)
+    lang = user["language"] if user else "ru"
     amount = int(callback.data.split("_")[1])
     
-    text = f"💎 <b>ОПЛАТА</b>\n\n"
-    text += f"💰 Сумма: {amount} TON\n\n"
+    comment = create_deposit_session(callback.from_user.id, amount)
+    
+    text = f"💎 <b>{get_text('deposit', lang)}</b>\n\n"
+    text += f"💰 {get_text('amount', lang) if 'amount' in get_text('', lang) else 'Сумма'}: {amount} TON\n\n"
     text += "━━━━━━━━━━━━━━━━━━━━━━\n"
-    text += f"📤 Отправьте перевод на кошелёк:\n\n"
+    text += "📤 " + ("Отправьте перевод на один из кошельков:" if lang == "ru" else "Send payment to one of the wallets:") + "\n\n"
     text += f"💎 TON:\n<code>{TON_WALLET}</code>\n\n"
     text += f"💵 USDT (TRC20):\n<code>{USDT_WALLET}</code>\n\n"
     text += "━━━━━━━━━━━━━━━━━━━━━━\n"
-    text += f"📩 По вопросам: {SUPPORT_USERNAME}\n\n"
-    text += "После оплаты напишите администратору @MollyWhip1"
+    text += "📝 <b>" + ("ВАЖНО!" if lang == "ru" else "IMPORTANT!") + "</b>\n"
+    text += ("В комментарии/описании платежа укажите:" if lang == "ru" else "In the payment comment, specify:") + "\n"
+    text += f"<code>{comment}</code>\n\n"
+    text += "❗ " + ("Без этого комментария бот не сможет зачислить средства!" if lang == "ru" else "Without this comment, the bot cannot credit funds!") + "\n"
+    text += "💰 " + ("Средства зачисляются автоматически в течение 1-5 минут." if lang == "ru" else "Funds are credited automatically within 1-5 minutes.") + "\n"
+    text += f"📩 {get_text('support', lang) if 'support' in get_text('', lang) else 'Поддержка'}: {SUPPORT_USERNAME}"
     
-    await callback.message.edit_text(text, reply_markup=get_back_keyboard(), parse_mode="HTML")
+    await callback.message.edit_text(text, reply_markup=get_back_keyboard(lang), parse_mode="HTML")
     await callback.answer()
 
 # -------------------- ВЫВОД --------------------
@@ -450,33 +769,35 @@ async def deposit_amount(callback: CallbackQuery):
 @dp.callback_query(F.data == "menu_withdraw")
 async def menu_withdraw(callback: CallbackQuery, state: FSMContext):
     user = get_user(callback.from_user.id)
+    lang = user["language"] if user else "ru"
     
-    text = f"💸 <b>ВЫВОД СРЕДСТВ</b>\n\n"
-    text += f"💰 Доступно: {format_ton(user['balance'])} TON\n"
-    text += f"📋 Минимум: {WITHDRAW_MIN} TON\n"
-    text += f"💸 Комиссия: {int(WITHDRAW_FEE * 100)}%\n\n"
-    text += f"Введите сумму для вывода:"
+    text = f"💸 <b>{get_text('withdraw', lang)}</b>\n\n"
+    text += f"{get_text('balance', lang)}: {format_ton(user['balance'])} TON\n"
+    text += f"📋 {get_text('min', lang) if 'min' in get_text('', lang) else 'Минимум'}: {WITHDRAW_MIN} TON\n"
+    text += f"💸 {get_text('fee', lang) if 'fee' in get_text('', lang) else 'Комиссия'}: {int(WITHDRAW_FEE * 100)}%\n\n"
+    text += "Введите сумму для вывода:" if lang == "ru" else "Enter withdrawal amount:"
     
-    await callback.message.edit_text(text, reply_markup=get_back_keyboard(), parse_mode="HTML")
+    await callback.message.edit_text(text, reply_markup=get_back_keyboard(lang), parse_mode="HTML")
     await state.set_state(WithdrawStates.waiting_amount)
     await callback.answer()
 
 @dp.message(WithdrawStates.waiting_amount)
 async def withdraw_amount(message: Message, state: FSMContext):
+    user = get_user(message.from_user.id)
+    lang = user["language"] if user else "ru"
+    
     try:
         amount = float(message.text.strip())
     except:
-        await message.answer("❌ Введите корректное число!")
+        await message.answer("❌ " + ("Введите корректное число!" if lang == "ru" else "Enter a valid number!"))
         return
     
-    user = get_user(message.from_user.id)
-    
     if amount < WITHDRAW_MIN:
-        await message.answer(f"❌ Минимальная сумма вывода: {WITHDRAW_MIN} TON")
+        await message.answer(f"❌ {get_text('min_error', lang, min=WITHDRAW_MIN)}")
         return
     
     if amount > user["balance"]:
-        await message.answer(f"❌ Недостаточно средств! Доступно: {format_ton(user['balance'])} TON")
+        await message.answer(f"❌ {get_text('insufficient', lang)} {format_ton(user['balance'])} TON")
         return
     
     fee = amount * WITHDRAW_FEE
@@ -486,14 +807,16 @@ async def withdraw_amount(message: Message, state: FSMContext):
     await state.set_state(WithdrawStates.waiting_address)
     
     await message.answer(
-        f"💰 Сумма: {format_ton(amount)} TON\n"
-        f"💸 Комиссия ({int(WITHDRAW_FEE*100)}%): {format_ton(fee)} TON\n"
-        f"📤 К выплате: {format_ton(final_amount)} TON\n\n"
-        f"📝 Введите адрес TON кошелька:"
+        f"💰 {get_text('amount', lang) if 'amount' in get_text('', lang) else 'Сумма'}: {format_ton(amount)} TON\n"
+        f"💸 {get_text('fee', lang) if 'fee' in get_text('', lang) else 'Комиссия'} ({int(WITHDRAW_FEE*100)}%): {format_ton(fee)} TON\n"
+        f"📤 {get_text('to_receive', lang) if 'to_receive' in get_text('', lang) else 'К выплате'}: {format_ton(final_amount)} TON\n\n"
+        f"📝 " + ("Введите адрес TON кошелька:" if lang == "ru" else "Enter TON wallet address:")
     )
 
 @dp.message(WithdrawStates.waiting_address)
 async def withdraw_address(message: Message, state: FSMContext):
+    user = get_user(message.from_user.id)
+    lang = user["language"] if user else "ru"
     address = message.text.strip()
     data = await state.get_data()
     
@@ -509,11 +832,11 @@ async def withdraw_address(message: Message, state: FSMContext):
             pass
     
     await message.answer(
-        f"✅ Заявка на вывод отправлена!\n\n"
-        f"💰 Сумма: {format_ton(data['amount'])} TON\n"
-        f"📤 К выплате: {format_ton(data['final_amount'])} TON\n\n"
-        f"⏰ Ожидайте подтверждения администратора.",
-        reply_markup=get_back_keyboard()
+        f"✅ {get_text('withdraw_sent', lang)}\n\n"
+        f"💰 {get_text('amount', lang) if 'amount' in get_text('', lang) else 'Сумма'}: {format_ton(data['amount'])} TON\n"
+        f"📤 {get_text('to_receive', lang) if 'to_receive' in get_text('', lang) else 'К выплате'}: {format_ton(data['final_amount'])} TON\n\n"
+        f"⏰ {get_text('awaiting', lang) if 'awaiting' in get_text('', lang) else 'Ожидайте подтверждения'}.",
+        reply_markup=get_back_keyboard(lang)
     )
     await state.clear()
 
@@ -534,7 +857,7 @@ async def admin_add_start(callback: CallbackQuery, state: FSMContext):
         return
     
     await state.set_state(AdminStates.waiting_user_id)
-    await callback.message.edit_text("💰 Введите ID пользователя:", reply_markup=get_back_keyboard())
+    await callback.message.edit_text("💰 Введите ID пользователя:", reply_markup=get_back_keyboard("ru"))
     await callback.answer()
 
 @dp.message(AdminStates.waiting_user_id)
@@ -573,7 +896,7 @@ async def admin_withdrawals(callback: CallbackQuery):
     withdrawals = get_pending_withdrawals()
     
     if not withdrawals:
-        await callback.message.edit_text("📭 Нет активных заявок на вывод", reply_markup=get_back_keyboard())
+        await callback.message.edit_text("📭 Нет активных заявок на вывод", reply_markup=get_back_keyboard("ru"))
         await callback.answer()
         return
     
@@ -608,19 +931,9 @@ async def reject_withdrawal(callback: CallbackQuery):
         return
     
     withdraw_id = int(callback.data.split("_")[1])
-    w = get_pending_withdrawals()
     update_withdrawal_status(withdraw_id, "rejected")
     
-    # Возвращаем средства
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT user_id, amount FROM withdrawals WHERE id = ?", (withdraw_id,))
-    row = cursor.fetchone()
-    if row:
-        update_balance(row[0], row[1])
-    conn.close()
-    
-    await callback.message.edit_text("❌ Вывод отклонён! Средства возвращены.")
+    await callback.message.edit_text("❌ Вывод отклонён!")
     await callback.answer()
 
 @dp.callback_query(F.data == "admin_stats")
@@ -639,15 +952,20 @@ async def admin_stats(callback: CallbackQuery):
     total_balance = cursor.fetchone()[0] or 0
     cursor.execute("SELECT COUNT(*) FROM withdrawals WHERE status='pending'")
     pending_withdrawals = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM deposits WHERE status='completed'")
+    deposits_count = cursor.fetchone()[0]
+    cursor.execute("SELECT SUM(amount) FROM deposits WHERE status='completed'")
+    deposits_sum = cursor.fetchone()[0] or 0
     conn.close()
     
     text = f"📊 <b>СТАТИСТИКА БОТА</b>\n\n"
     text += f"👥 Пользователей: {users_count}\n"
     text += f"👷 Куплено рабочих: {workers_count}\n"
     text += f"💰 Всего баланс: {format_ton(total_balance)} TON\n"
+    text += f"💎 Пополнений: {deposits_count} на {format_ton(deposits_sum)} TON\n"
     text += f"⏳ Заявок на вывод: {pending_withdrawals}"
     
-    await callback.message.edit_text(text, reply_markup=get_back_keyboard(), parse_mode="HTML")
+    await callback.message.edit_text(text, reply_markup=get_back_keyboard("ru"), parse_mode="HTML")
     await callback.answer()
 
 # -------------------- МАГАЗИН --------------------
@@ -655,73 +973,78 @@ async def admin_stats(callback: CallbackQuery):
 @dp.callback_query(F.data == "menu_shop")
 async def menu_shop(callback: CallbackQuery):
     user = get_user(callback.from_user.id)
+    lang = user["language"] if user else "ru"
     
-    text = f"🏪 <b>МАГАЗИН</b>\n\n"
-    text += f"💰 Баланс: {format_ton(user['balance'])} TON\n\n"
-    text += f"👇 Выберите рабочего:"
+    text = f"🏪 <b>{get_text('shop', lang)}</b>\n\n"
+    text += f"{get_text('balance', lang)}: {format_ton(user['balance'])} TON\n\n"
+    text += "👇 " + ("Выберите рабочего:" if lang == "ru" else "Choose a worker:")
     
-    await callback.message.edit_text(text, reply_markup=get_shop_keyboard(), parse_mode="HTML")
+    await callback.message.edit_text(text, reply_markup=get_shop_keyboard(lang), parse_mode="HTML")
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("buy_"))
 async def buy_worker(callback: CallbackQuery):
+    user = get_user(callback.from_user.id)
+    lang = user["language"] if user else "ru"
     worker_id = int(callback.data.split("_")[1])
     worker = WORKERS[worker_id]
-    user = get_user(callback.from_user.id)
     
     if user["balance"] < worker["cost"]:
-        await callback.answer(f"❌ Недостаточно средств! Нужно: {worker['cost']} TON", show_alert=True)
+        await callback.answer(f"❌ {get_text('insufficient', lang)} {worker['cost']} TON", show_alert=True)
         return
     
     update_balance(callback.from_user.id, -worker["cost"])
     add_worker(callback.from_user.id, worker_id)
     
-    await callback.answer(f"✅ Вы купили {worker['name']}!", show_alert=True)
+    name = worker[f"name_{lang}"] if lang in worker else worker["name_ru"]
+    await callback.answer(f"✅ {get_text('bought', lang, name=name)}", show_alert=True)
     await menu_shop(callback)
 
 # -------------------- РАБОЧИЕ --------------------
 
 @dp.callback_query(F.data == "menu_workers")
 async def menu_workers(callback: CallbackQuery):
+    user = get_user(callback.from_user.id)
+    lang = user["language"] if user else "ru"
     user_id = callback.from_user.id
-    user = get_user(user_id)
     workers = get_workers(user_id)
     income = calculate_income(user_id)
     pending = calculate_pending(user_id)
     
-    text = f"👷 <b>МОИ РАБОЧИЕ</b>\n\n"
-    text += f"💰 Баланс: {format_ton(user['balance'])} TON\n"
-    text += f"📈 Доход/день: {format_ton(income)} TON\n"
-    text += f"⏳ Накоплено: {format_ton(pending)} TON\n\n"
+    text = f"👷 <b>{get_text('my_workers', lang)}</b>\n\n"
+    text += f"{get_text('balance', lang)}: {format_ton(user['balance'])} TON\n"
+    text += f"{get_text('income', lang)}: {format_ton(income)} TON\n"
+    text += f"{get_text('pending', lang)}: {format_ton(pending)} TON\n\n"
     
     if not workers:
-        text += "😔 У вас нет рабочих. Зайдите в магазин!"
+        text += "😔 " + ("У вас нет рабочих. Зайдите в магазин!" if lang == "ru" else "You have no workers. Go to the shop!")
     else:
-        text += "📋 Список рабочих:\n━━━━━━━━━━━━━━━━━━━━━━\n"
+        text += "📋 " + ("Список рабочих:" if lang == "ru" else "Workers list:") + "\n━━━━━━━━━━━━━━━━━━━━━━\n"
         for w in workers:
             worker_type = w[0]
             count = w[1]
-            name = WORKERS[worker_type]["name"]
+            name = WORKERS[worker_type][f"name_{lang}"] if lang in WORKERS[worker_type] else WORKERS[worker_type]["name_ru"]
             income_day = WORKERS[worker_type]["income"] * count
             text += f"{name} ×{count}\n└ {income_day:.4f} TON/день\n"
     
-    await callback.message.edit_text(text, reply_markup=get_workers_keyboard(), parse_mode="HTML")
+    await callback.message.edit_text(text, reply_markup=get_workers_keyboard(lang), parse_mode="HTML")
     await callback.answer()
 
 @dp.callback_query(F.data == "collect")
 async def collect_income(callback: CallbackQuery):
+    user = get_user(callback.from_user.id)
+    lang = user["language"] if user else "ru"
     user_id = callback.from_user.id
     pending = calculate_pending(user_id)
     
     if pending < 0.001:
-        await callback.answer("⏰ Ещё нечего собирать!", show_alert=True)
+        await callback.answer("⏰ " + ("Ещё нечего собирать!" if lang == "ru" else "Nothing to collect yet!"), show_alert=True)
         return
     
     update_balance(user_id, pending)
     update_last_collect(user_id)
-    user = get_user(user_id)
     
-    await callback.answer(f"✅ Собрано {format_ton(pending)} TON!", show_alert=True)
+    await callback.answer(f"✅ {get_text('collected', lang, amount=format_ton(pending))}", show_alert=True)
     await menu_workers(callback)
 
 # -------------------- ФЕРМА --------------------
@@ -729,36 +1052,38 @@ async def collect_income(callback: CallbackQuery):
 @dp.callback_query(F.data == "menu_farm")
 async def menu_farm(callback: CallbackQuery):
     user = get_user(callback.from_user.id)
+    lang = user["language"] if user else "ru"
     level = user["farm_level"]
     farm = FARM_LEVELS[level]
     workers_count = get_worker_count(callback.from_user.id)
     
     stars = "⭐" * level + "☆" * (10 - level)
     
-    text = f"🌾 <b>ФЕРМА</b>\n\n"
-    text += f"📊 Уровень: {level}/10\n{stars}\n\n"
-    text += f"👷 Рабочих: {workers_count}\n"
-    text += f"🎁 Бонус: +{farm['bonus']}%\n\n"
+    text = f"🌾 <b>{get_text('farm', lang)}</b>\n\n"
+    text += f"📊 {get_text('level', lang) if 'level' in get_text('', lang) else 'Уровень'}: {level}/10\n{stars}\n\n"
+    text += f"{get_text('workers', lang)}: {workers_count}\n"
+    text += f"🎁 {get_text('bonus', lang) if 'bonus' in get_text('', lang) else 'Бонус'}: +{farm['bonus']}%\n\n"
     
     if level < 10:
         next_farm = FARM_LEVELS[level + 1]
-        text += f"⬆️ Следующий уровень:\n"
-        text += f"💰 Стоимость: {next_farm['cost']} TON\n"
-        text += f"👷 Нужно рабочих: {next_farm['workers']}\n"
-        text += f"🎁 Новый бонус: +{next_farm['bonus']}%"
+        text += f"⬆️ {get_text('next_level', lang) if 'next_level' in get_text('', lang) else 'Следующий уровень'}:\n"
+        text += f"💰 {get_text('cost', lang) if 'cost' in get_text('', lang) else 'Стоимость'}: {next_farm['cost']} TON\n"
+        text += f"👷 {get_text('workers_needed', lang) if 'workers_needed' in get_text('', lang) else 'Нужно рабочих'}: {next_farm['workers']}\n"
+        text += f"🎁 {get_text('new_bonus', lang) if 'new_bonus' in get_text('', lang) else 'Новый бонус'}: +{next_farm['bonus']}%"
     else:
-        text += "🏆 Ферма полностью прокачана!"
+        text += "🏆 " + ("Ферма полностью прокачана!" if lang == "ru" else "Farm is fully upgraded!")
     
-    await callback.message.edit_text(text, reply_markup=get_farm_keyboard(user), parse_mode="HTML")
+    await callback.message.edit_text(text, reply_markup=get_farm_keyboard(user, lang), parse_mode="HTML")
     await callback.answer()
 
 @dp.callback_query(F.data == "upgrade_farm")
 async def upgrade_farm(callback: CallbackQuery):
     user = get_user(callback.from_user.id)
+    lang = user["language"] if user else "ru"
     current_level = user["farm_level"]
     
     if current_level >= 10:
-        await callback.answer("Максимальный уровень!", show_alert=True)
+        await callback.answer("❌ " + ("Максимальный уровень!" if lang == "ru" else "Maximum level!"), show_alert=True)
         return
     
     next_level = current_level + 1
@@ -766,17 +1091,17 @@ async def upgrade_farm(callback: CallbackQuery):
     workers_count = get_worker_count(callback.from_user.id)
     
     if workers_count < next_farm["workers"]:
-        await callback.answer(f"❌ Нужно {next_farm['workers']} рабочих!", show_alert=True)
+        await callback.answer(f"❌ {get_text('workers_needed_error', lang, workers=next_farm['workers'])}", show_alert=True)
         return
     
     if user["balance"] < next_farm["cost"]:
-        await callback.answer(f"❌ Недостаточно средств! Нужно: {next_farm['cost']} TON", show_alert=True)
+        await callback.answer(f"❌ {get_text('insufficient', lang)} {next_farm['cost']} TON", show_alert=True)
         return
     
     update_balance(callback.from_user.id, -next_farm["cost"])
     update_farm_level(callback.from_user.id, next_level)
     
-    await callback.answer(f"✅ Ферма улучшена до {next_level} уровня!", show_alert=True)
+    await callback.answer(f"✅ {get_text('farm_upgraded', lang, level=next_level)}", show_alert=True)
     await menu_farm(callback)
 
 # -------------------- ЕЖЕДНЕВНЫЙ БОНУС --------------------
@@ -784,55 +1109,65 @@ async def upgrade_farm(callback: CallbackQuery):
 @dp.callback_query(F.data == "menu_daily")
 async def menu_daily(callback: CallbackQuery):
     user = get_user(callback.from_user.id)
+    lang = user["language"] if user else "ru"
+    user_id = callback.from_user.id
     
-    bonus = 0.05
-    streak = user["streak"] + 1
+    today = datetime.now().date().isoformat()
+    streak = user["streak"]
+    last_daily = user["last_daily"]
     
-    update_balance(callback.from_user.id, bonus)
+    if last_daily:
+        if last_daily == today:
+            await callback.answer("⏰ " + ("Бонус уже получен сегодня!" if lang == "ru" else "Bonus already claimed today!"), show_alert=True)
+            return
+        elif (datetime.now().date() - datetime.fromisoformat(last_daily).date()).days > 1:
+            streak = 0
     
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("UPDATE users SET streak = ? WHERE user_id = ?", (streak, callback.from_user.id))
-    conn.commit()
-    conn.close()
+    streak += 1
+    bonus = get_daily_bonus(streak)
     
-    text = f"🎁 <b>ЕЖЕДНЕВНЫЙ БОНУС</b>\n\n"
-    text += f"✅ Бонус получен!\n\n"
+    update_balance(user_id, bonus)
+    update_daily_streak(user_id, streak, today)
+    user = get_user(user_id)
+    
+    text = f"🎁 <b>{get_text('daily', lang)}</b>\n\n"
+    text += f"✅ {get_text('bonus_received', lang)}\n\n"
     text += f"💰 +{bonus} TON\n"
-    text += f"🔥 Серия: {streak} дней"
+    text += f"🔥 {get_text('streak', lang) if 'streak' in get_text('', lang) else 'Серия'}: {streak} {get_text('days', lang) if 'days' in get_text('', lang) else 'дней'}\n"
+    text += f"💳 {get_text('balance', lang)}: {format_ton(user['balance'])} TON"
     
-    await callback.message.edit_text(text, reply_markup=get_back_keyboard(), parse_mode="HTML")
+    await callback.message.edit_text(text, reply_markup=get_back_keyboard(lang), parse_mode="HTML")
     await callback.answer()
 
 # -------------------- РЕФЕРАЛЫ --------------------
 
 @dp.callback_query(F.data == "menu_referral")
 async def menu_referral(callback: CallbackQuery):
+    user = get_user(callback.from_user.id)
+    lang = user["language"] if user else "ru"
     user_id = callback.from_user.id
     bot_info = await bot.get_me()
     link = f"https://t.me/{bot_info.username}?start={user_id}"
     
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT COUNT(*) FROM users WHERE referred_by = ?", (user_id,))
-    ref_count = cursor.fetchone()[0]
-    conn.close()
+    ref_count = get_referrals_count(user_id)
     
-    text = f"👥 <b>РЕФЕРАЛЬНАЯ ПРОГРАММА</b>\n\n"
-    text += f"👥 Рефералов: {ref_count}\n\n"
-    text += f"🔗 Ваша ссылка:\n<code>{link}</code>\n\n"
-    text += f"📊 Вы получаете 7% от дохода ваших рефералов!"
+    text = f"👥 <b>{get_text('referral', lang)}</b>\n\n"
+    text += f"👥 {get_text('referrals_count', lang) if 'referrals_count' in get_text('', lang) else 'Рефералов'}: {ref_count}\n\n"
+    text += f"🔗 {get_text('your_link', lang) if 'your_link' in get_text('', lang) else 'Ваша ссылка'}:\n<code>{link}</code>\n\n"
+    text += f"📊 {get_text('referral_reward', lang) if 'referral_reward' in get_text('', lang) else 'Вы получаете 7% от дохода ваших рефералов!'}"
     
-    await callback.message.edit_text(text, reply_markup=get_back_keyboard(), parse_mode="HTML")
+    await callback.message.edit_text(text, reply_markup=get_back_keyboard(lang), parse_mode="HTML")
     await callback.answer()
 
 # -------------------- ТОП --------------------
 
 @dp.callback_query(F.data == "menu_top")
 async def menu_top(callback: CallbackQuery):
+    user = get_user(callback.from_user.id)
+    lang = user["language"] if user else "ru"
     top = get_top_players()
     
-    text = f"🏆 <b>ТОП ИГРОКОВ</b>\n\n"
+    text = f"🏆 <b>{get_text('top', lang)}</b>\n\n"
     medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
     
     for i, player in enumerate(top):
@@ -841,14 +1176,37 @@ async def menu_top(callback: CallbackQuery):
         else:
             text += f"{i+1}. {player[0] or 'Аноним'} — {format_ton(player[1])} TON\n"
     
-    await callback.message.edit_text(text, reply_markup=get_back_keyboard(), parse_mode="HTML")
+    await callback.message.edit_text(text, reply_markup=get_back_keyboard(lang), parse_mode="HTML")
     await callback.answer()
+
+# -------------------- ЯЗЫК --------------------
+
+@dp.callback_query(F.data == "menu_language")
+async def menu_language(callback: CallbackQuery):
+    await callback.message.edit_text("🌍 Выберите язык / Choose language:", reply_markup=get_language_keyboard())
+    await callback.answer()
+
+@dp.callback_query(F.data == "lang_ru")
+async def set_lang_ru(callback: CallbackQuery):
+    update_user_language(callback.from_user.id, "ru")
+    await callback.answer("✅ Язык изменён на Русский!")
+    await back_to_menu(callback)
+
+@dp.callback_query(F.data == "lang_en")
+async def set_lang_en(callback: CallbackQuery):
+    update_user_language(callback.from_user.id, "en")
+    await callback.answer("✅ Language changed to English!")
+    await back_to_menu(callback)
 
 # ==================== ЗАПУСК ====================
 
 async def main():
     init_db()
     print("✅ База данных инициализирована")
+    
+    # Запускаем проверку платежей в фоне
+    asyncio.create_task(start_payment_checker())
+    
     print("🚀 Бот запущен!")
     await dp.start_polling(bot)
 
