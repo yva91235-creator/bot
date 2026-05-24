@@ -1,7 +1,6 @@
 import asyncio
 import sqlite3
-import json
-from datetime import datetime, timedelta
+from datetime import datetime
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
@@ -9,7 +8,42 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 
-from config import BOT_TOKEN, WORKERS, FARM_LEVELS, WITHDRAW_MIN, WITHDRAW_FEE, ADMIN_IDS, TON_WALLET, USDT_WALLET, SUPPORT_USERNAME
+# ==================== КОНФИГ ====================
+
+BOT_TOKEN = "8305173759:AAGUQBAxSuBLgcxquzUliGTkwoBQpHtepG8"
+TON_WALLET = "UQDtRwosWY6VfPnwovLRcF2yo46Xv3BcK-mV1Da-1LwbVIaE"
+USDT_WALLET = "TKPuYeveSA2giJV9fFcgbCDsY6abmzMS7Z"
+SUPPORT_USERNAME = "@MollyWhip1"
+ADMIN_IDS = [8353710361]
+
+WORKERS = {
+    1: {"name": "🧑‍🌾 Стажёр", "cost": 1, "income": 0.003},
+    2: {"name": "👨‍🔧 Разнорабочий", "cost": 5, "income": 0.02},
+    3: {"name": "👷 Шахтёр", "cost": 20, "income": 0.10},
+    4: {"name": "🔧 Инженер", "cost": 50, "income": 0.30},
+    5: {"name": "🧙‍♂️ Бурильщик", "cost": 100, "income": 0.70},
+    6: {"name": "⚙️ Механик", "cost": 200, "income": 1.60},
+    7: {"name": "🏭 Директор шахты", "cost": 500, "income": 4.50},
+    8: {"name": "👑 Магнат", "cost": 1000, "income": 10.00},
+    9: {"name": "⭐ Олигарх", "cost": 2500, "income": 30.00},
+    10: {"name": "💎 Крипто-король", "cost": 5000, "income": 75.00},
+}
+
+FARM_LEVELS = {
+    1: {"workers": 0, "bonus": 0, "cost": 0},
+    2: {"workers": 5, "bonus": 5, "cost": 50},
+    3: {"workers": 10, "bonus": 10, "cost": 100},
+    4: {"workers": 20, "bonus": 15, "cost": 200},
+    5: {"workers": 35, "bonus": 20, "cost": 400},
+    6: {"workers": 50, "bonus": 30, "cost": 700},
+    7: {"workers": 75, "bonus": 40, "cost": 1000},
+    8: {"workers": 100, "bonus": 50, "cost": 1500},
+    9: {"workers": 150, "bonus": 60, "cost": 2000},
+    10: {"workers": 200, "bonus": 75, "cost": 3000},
+}
+
+WITHDRAW_MIN = 10
+WITHDRAW_FEE = 0.05
 
 # ==================== БАЗА ДАННЫХ ====================
 
@@ -28,9 +62,7 @@ def init_db():
             farm_level INTEGER DEFAULT 1,
             last_collect TEXT,
             streak INTEGER DEFAULT 0,
-            ref_earned REAL DEFAULT 0,
-            referred_by INTEGER,
-            language TEXT DEFAULT 'ru'
+            referred_by INTEGER
         )
     ''')
     
@@ -54,17 +86,6 @@ def init_db():
         )
     ''')
     
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS deposits (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            amount REAL,
-            tx_hash TEXT,
-            status TEXT DEFAULT 'pending',
-            created_at TEXT
-        )
-    ''')
-    
     conn.commit()
     conn.close()
 
@@ -72,20 +93,18 @@ def get_user(user_id):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
-    user = cursor.fetchone()
+    row = cursor.fetchone()
     conn.close()
-    if user:
+    if row:
         return {
-            "user_id": user[0],
-            "username": user[1],
-            "balance": user[2],
-            "total_workers": user[3],
-            "farm_level": user[4],
-            "last_collect": user[5],
-            "streak": user[6],
-            "ref_earned": user[7],
-            "referred_by": user[8],
-            "language": user[9] if len(user) > 9 else "ru"
+            "user_id": row[0],
+            "username": row[1],
+            "balance": row[2],
+            "total_workers": row[3],
+            "farm_level": row[4],
+            "last_collect": row[5],
+            "streak": row[6],
+            "referred_by": row[7]
         }
     return None
 
@@ -217,7 +236,7 @@ def format_ton(amount):
 
 # ==================== КЛАВИАТУРЫ ====================
 
-def get_main_keyboard(lang="ru"):
+def get_main_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="👤 Профиль", callback_data="menu_profile")],
         [InlineKeyboardButton(text="🏪 Магазин", callback_data="menu_shop")],
@@ -225,16 +244,15 @@ def get_main_keyboard(lang="ru"):
         [InlineKeyboardButton(text="🌾 Ферма", callback_data="menu_farm")],
         [InlineKeyboardButton(text="🎁 Бонус", callback_data="menu_daily")],
         [InlineKeyboardButton(text="👥 Рефералы", callback_data="menu_referral")],
-        [InlineKeyboardButton(text="📊 Топ", callback_data="menu_top")],
-        [InlineKeyboardButton(text="🌍 Язык", callback_data="menu_language")],
+        [InlineKeyboardButton(text="🏆 Топ", callback_data="menu_top")],
     ])
 
-def get_back_keyboard(lang="ru"):
+def get_back_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_menu")]
     ])
 
-def get_shop_keyboard(lang="ru"):
+def get_shop_keyboard():
     buttons = []
     for wid, w in WORKERS.items():
         buttons.append([InlineKeyboardButton(
@@ -244,13 +262,13 @@ def get_shop_keyboard(lang="ru"):
     buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_menu")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-def get_workers_keyboard(lang="ru"):
+def get_workers_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💰 Собрать доход", callback_data="collect")],
         [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_menu")],
     ])
 
-def get_farm_keyboard(user, lang="ru"):
+def get_farm_keyboard(user):
     buttons = []
     current_level = user["farm_level"]
     if current_level < 10:
@@ -263,14 +281,14 @@ def get_farm_keyboard(user, lang="ru"):
     buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_menu")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-def get_profile_keyboard(lang="ru"):
+def get_profile_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💎 Пополнить", callback_data="menu_deposit")],
         [InlineKeyboardButton(text="💸 Вывести", callback_data="menu_withdraw")],
         [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_menu")],
     ])
 
-def get_deposit_keyboard(lang="ru"):
+def get_deposit_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💎 10 TON", callback_data="deposit_10")],
         [InlineKeyboardButton(text="💎 25 TON", callback_data="deposit_25")],
@@ -279,14 +297,12 @@ def get_deposit_keyboard(lang="ru"):
         [InlineKeyboardButton(text="💎 250 TON", callback_data="deposit_250")],
         [InlineKeyboardButton(text="💎 500 TON", callback_data="deposit_500")],
         [InlineKeyboardButton(text="💎 1000 TON", callback_data="deposit_1000")],
-        [InlineKeyboardButton(text="✏️ Своя сумма", callback_data="deposit_custom")],
         [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_menu")],
     ])
 
-def get_withdraw_keyboard(lang="ru"):
+def get_withdraw_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💸 Вывести TON", callback_data="withdraw_ton")],
-        [InlineKeyboardButton(text="💵 Вывести USDT", callback_data="withdraw_usdt")],
+        [InlineKeyboardButton(text="💸 Вывести", callback_data="withdraw_start")],
         [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_menu")],
     ])
 
@@ -305,25 +321,22 @@ def get_withdrawal_buttons(withdraw_id):
         ]
     ])
 
-# ==================== КЛАССЫ ДЛЯ FSM ====================
+# ==================== FSM СОСТОЯНИЯ ====================
 
 class WithdrawStates(StatesGroup):
     waiting_amount = State()
     waiting_address = State()
 
-class DepositStates(StatesGroup):
-    waiting_custom_amount = State()
-
 class AdminStates(StatesGroup):
     waiting_user_id = State()
     waiting_amount = State()
 
-# ==================== ОСНОВНОЙ БОТ ====================
+# ==================== БОТ ====================
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-# -------------------- ГЛАВНОЕ МЕНЮ --------------------
+# -------------------- СТАРТ --------------------
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
@@ -406,24 +419,18 @@ async def menu_profile(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "menu_deposit")
 async def menu_deposit(callback: CallbackQuery):
+    user = get_user(callback.from_user.id)
+    
     text = f"💎 <b>ПОПОЛНЕНИЕ БАЛАНСА</b>\n\n"
-    text += f"💰 Ваш баланс: {format_ton(get_user(callback.from_user.id)['balance'])} TON\n\n"
+    text += f"💰 Ваш баланс: {format_ton(user['balance'])} TON\n\n"
     text += "Выберите сумму для пополнения:"
     
     await callback.message.edit_text(text, reply_markup=get_deposit_keyboard(), parse_mode="HTML")
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("deposit_"))
-async def deposit_amount(callback: CallbackQuery, state: FSMContext):
-    data = callback.data
-    
-    if data == "deposit_custom":
-        await state.set_state(DepositStates.waiting_custom_amount)
-        await callback.message.edit_text("✏️ Введите сумму в TON:", reply_markup=get_back_keyboard())
-        await callback.answer()
-        return
-    
-    amount = int(data.split("_")[1])
+async def deposit_amount(callback: CallbackQuery):
+    amount = int(callback.data.split("_")[1])
     
     text = f"💎 <b>ОПЛАТА</b>\n\n"
     text += f"💰 Сумма: {amount} TON\n\n"
@@ -433,64 +440,10 @@ async def deposit_amount(callback: CallbackQuery, state: FSMContext):
     text += f"💵 USDT (TRC20):\n<code>{USDT_WALLET}</code>\n\n"
     text += "━━━━━━━━━━━━━━━━━━━━━━\n"
     text += f"📩 По вопросам: {SUPPORT_USERNAME}\n\n"
-    text += "✅ После оплаты нажмите «Готово»"
+    text += "После оплаты напишите администратору @MollyWhip1"
     
-    done_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Готово", callback_data=f"deposit_done_{amount}")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="menu_deposit")],
-    ])
-    
-    await callback.message.edit_text(text, reply_markup=done_keyboard, parse_mode="HTML")
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("deposit_done_"))
-async def deposit_done(callback: CallbackQuery):
-    amount = float(callback.data.split("_")[2])
-    
-    # В реальном проекте здесь проверка транзакции
-    # Сейчас просто зачисляем вручную через админа
-    
-    text = f"✅ Заявка на пополнение {amount} TON отправлена администратору!\n\nОжидайте подтверждения."
     await callback.message.edit_text(text, reply_markup=get_back_keyboard(), parse_mode="HTML")
-    
-    # Уведомление админу
-    for admin_id in ADMIN_IDS:
-        try:
-            admin_text = f"💰 ЗАЯВКА НА ПОПОЛНЕНИЕ\n\n👤 {callback.from_user.id}\n💰 Сумма: {amount} TON"
-            admin_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="✅ Зачислить", callback_data=f"admin_deposit_{callback.from_user.id}_{amount}")]
-            ])
-            await bot.send_message(admin_id, admin_text, reply_markup=admin_keyboard)
-        except:
-            pass
-    
     await callback.answer()
-
-@dp.callback_query(DepositStates.waiting_custom_amount)
-async def deposit_custom_amount(message: Message, state: FSMContext):
-    try:
-        amount = float(message.text.strip())
-    except:
-        await message.answer("❌ Введите корректное число!")
-        return
-    
-    text = f"💎 <b>ОПЛАТА</b>\n\n"
-    text += f"💰 Сумма: {amount} TON\n\n"
-    text += "━━━━━━━━━━━━━━━━━━━━━━\n"
-    text += f"📤 Отправьте перевод на кошелёк:\n\n"
-    text += f"💎 TON:\n<code>{TON_WALLET}</code>\n\n"
-    text += f"💵 USDT (TRC20):\n<code>{USDT_WALLET}</code>\n\n"
-    text += "━━━━━━━━━━━━━━━━━━━━━━\n"
-    text += f"📩 По вопросам: {SUPPORT_USERNAME}\n\n"
-    text += "✅ После оплаты нажмите «Готово»"
-    
-    done_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Готово", callback_data=f"deposit_done_{amount}")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="menu_deposit")],
-    ])
-    
-    await message.answer(text, reply_markup=done_keyboard, parse_mode="HTML")
-    await state.clear()
 
 # -------------------- ВЫВОД --------------------
 
@@ -502,21 +455,10 @@ async def menu_withdraw(callback: CallbackQuery, state: FSMContext):
     text += f"💰 Доступно: {format_ton(user['balance'])} TON\n"
     text += f"📋 Минимум: {WITHDRAW_MIN} TON\n"
     text += f"💸 Комиссия: {int(WITHDRAW_FEE * 100)}%\n\n"
-    text += f"Выберите способ вывода:"
+    text += f"Введите сумму для вывода:"
     
-    await callback.message.edit_text(text, reply_markup=get_withdraw_keyboard(), parse_mode="HTML")
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("withdraw_"))
-async def withdraw_type(callback: CallbackQuery, state: FSMContext):
-    wallet_type = callback.data.split("_")[1]
-    await state.update_data(wallet_type=wallet_type)
+    await callback.message.edit_text(text, reply_markup=get_back_keyboard(), parse_mode="HTML")
     await state.set_state(WithdrawStates.waiting_amount)
-    
-    await callback.message.edit_text(
-        f"💸 Введите сумму вывода (мин. {WITHDRAW_MIN} TON):",
-        reply_markup=get_back_keyboard()
-    )
     await callback.answer()
 
 @dp.message(WithdrawStates.waiting_amount)
@@ -547,7 +489,7 @@ async def withdraw_amount(message: Message, state: FSMContext):
         f"💰 Сумма: {format_ton(amount)} TON\n"
         f"💸 Комиссия ({int(WITHDRAW_FEE*100)}%): {format_ton(fee)} TON\n"
         f"📤 К выплате: {format_ton(final_amount)} TON\n\n"
-        f"📝 Введите адрес кошелька:"
+        f"📝 Введите адрес TON кошелька:"
     )
 
 @dp.message(WithdrawStates.waiting_address)
@@ -666,30 +608,19 @@ async def reject_withdrawal(callback: CallbackQuery):
         return
     
     withdraw_id = int(callback.data.split("_")[1])
+    w = get_pending_withdrawals()
     update_withdrawal_status(withdraw_id, "rejected")
     
-    await callback.message.edit_text("❌ Вывод отклонён!")
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("admin_deposit_"))
-async def admin_deposit(callback: CallbackQuery):
-    if callback.from_user.id not in ADMIN_IDS:
-        await callback.answer("Нет доступа")
-        return
+    # Возвращаем средства
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id, amount FROM withdrawals WHERE id = ?", (withdraw_id,))
+    row = cursor.fetchone()
+    if row:
+        update_balance(row[0], row[1])
+    conn.close()
     
-    parts = callback.data.split("_")
-    user_id = int(parts[2])
-    amount = float(parts[3])
-    
-    update_balance(user_id, amount)
-    
-    await callback.message.edit_text(f"✅ Зачислено {amount} TON пользователю {user_id}")
-    
-    try:
-        await bot.send_message(user_id, f"✅ Ваш баланс пополнен!\n💰 +{amount} TON")
-    except:
-        pass
-    
+    await callback.message.edit_text("❌ Вывод отклонён! Средства возвращены.")
     await callback.answer()
 
 @dp.callback_query(F.data == "admin_stats")
@@ -791,23 +722,7 @@ async def collect_income(callback: CallbackQuery):
     user = get_user(user_id)
     
     await callback.answer(f"✅ Собрано {format_ton(pending)} TON!", show_alert=True)
-    
-    text = f"👷 <b>МОИ РАБОЧИЕ</b>\n\n"
-    text += f"💰 Баланс: {format_ton(user['balance'])} TON\n"
-    text += f"📈 Доход/день: {format_ton(calculate_income(user_id))} TON\n"
-    text += f"⏳ Накоплено: 0 TON\n\n"
-    
-    workers = get_workers(user_id)
-    if workers:
-        text += "📋 Список рабочих:\n━━━━━━━━━━━━━━━━━━━━━━\n"
-        for w in workers:
-            worker_type = w[0]
-            count = w[1]
-            name = WORKERS[worker_type]["name"]
-            income_day = WORKERS[worker_type]["income"] * count
-            text += f"{name} ×{count}\n└ {income_day:.4f} TON/день\n"
-    
-    await callback.message.edit_text(text, reply_markup=get_workers_keyboard(), parse_mode="HTML")
+    await menu_workers(callback)
 
 # -------------------- ФЕРМА --------------------
 
@@ -884,8 +799,7 @@ async def menu_daily(callback: CallbackQuery):
     text = f"🎁 <b>ЕЖЕДНЕВНЫЙ БОНУС</b>\n\n"
     text += f"✅ Бонус получен!\n\n"
     text += f"💰 +{bonus} TON\n"
-    text += f"🔥 Серия: {streak} дней\n\n"
-    text += f"💎 Завтра: +{0.07} TON"
+    text += f"🔥 Серия: {streak} дней"
     
     await callback.message.edit_text(text, reply_markup=get_back_keyboard(), parse_mode="HTML")
     await callback.answer()
@@ -929,43 +843,6 @@ async def menu_top(callback: CallbackQuery):
     
     await callback.message.edit_text(text, reply_markup=get_back_keyboard(), parse_mode="HTML")
     await callback.answer()
-
-# -------------------- ЯЗЫК --------------------
-
-@dp.callback_query(F.data == "menu_language")
-async def menu_language(callback: CallbackQuery):
-    text = "🌍 Выберите язык / Choose language:"
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🇷🇺 Русский", callback_data="lang_ru")],
-        [InlineKeyboardButton(text="🇬🇧 English", callback_data="lang_en")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_menu")],
-    ])
-    
-    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
-    await callback.answer()
-
-@dp.callback_query(F.data == "lang_ru")
-async def set_lang_ru(callback: CallbackQuery):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("UPDATE users SET language = 'ru' WHERE user_id = ?", (callback.from_user.id,))
-    conn.commit()
-    conn.close()
-    
-    await callback.answer("✅ Язык изменён на Русский!")
-    await back_to_menu(callback)
-
-@dp.callback_query(F.data == "lang_en")
-async def set_lang_en(callback: CallbackQuery):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("UPDATE users SET language = 'en' WHERE user_id = ?", (callback.from_user.id,))
-    conn.commit()
-    conn.close()
-    
-    await callback.answer("✅ Language changed to English!")
-    await back_to_menu(callback)
 
 # ==================== ЗАПУСК ====================
 
